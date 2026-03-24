@@ -1,14 +1,20 @@
-# Harbor 离线镜像包（体积过大，由 CI 从官方下载）
-harbor/harbor.v*.tar.gz
-harbor/*.tar.gz
+# ── ARM64 离线镜像包（体积过大，由本地存放或从 Release 下载）──────────────
+arm64/harbor.v*.tar.gz
+arm64/*.tar.gz
+
+# ── 旧目录遗留文件（迁移前的 harbor/ 目录）────────────────────────────────
+harbor/
 harbor.zip
 
-# Harbor 运行时生成的配置和数据（不应提交）
-harbor/common/config/
-harbor/docker-compose.yml
-harbor/harbor.yml
-harbor/harbor.yml.bak
-harbor/input/
+# ── Harbor 运行时生成的配置和数据（不应提交）──────────────────────────────
+common/config/
+docker-compose.yml
+harbor.yml
+harbor.yml.bak
+input/
 
-# 本地测试数据目录
+# ── 本地测试数据目录 ────────────────────────────────────────────────────────
 harbor-data/
+
+# ── 系统文件 ─────────────────────────────────────────────────────────────────
+.DS_Store
