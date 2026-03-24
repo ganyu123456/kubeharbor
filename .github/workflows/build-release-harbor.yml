@@ -1,0 +1,369 @@
+name: 构建和发布 Harbor 离线安装包
+
+# ── 触发条件 ────────────────────────────────────────────────────────────────
+# 1. 推送 harbor-v* 格式的 tag（如 harbor-v2.13.0）→ 自动构建发布
+# 2. 手动触发（workflow_dispatch）→ 可指定版本和 arm64 镜像来源
+#
+# ── arm64 镜像来源说明 ────────────────────────────────────────────────────────
+# 官方不提供 arm64 离线包，需要将 harbor.v<VERSION>.tar.gz 预先上传到本仓库的
+# GitHub Release 中（tag: harbor-arm64-base）作为 asset，工作流从那里下载。
+#
+# 上传步骤（一次性操作）：
+#   1. 在 GitHub 仓库 → Releases → Create a new release
+#   2. tag: harbor-arm64-base，title: Harbor ARM64 Base Images
+#   3. 上传 harbor.v2.13.0.tar.gz 作为附件
+#   4. 发布（可选 pre-release）
+# ────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    tags:
+      - 'harbor-v*'
+    paths:
+      - 'harbor/deploy-local.sh'
+      - '.github/workflows/build-release-harbor.yml'
+  workflow_dispatch:
+    inputs:
+      harbor_version:
+        description: 'Harbor 版本号（如 v2.13.0）'
+        required: true
+        default: 'v2.13.0'
+      arm64_base_tag:
+        description: 'arm64 镜像所在的 Release tag（默认 harbor-arm64-base）'
+        required: false
+        default: 'harbor-arm64-base'
+
+permissions:
+  contents: write
+
+# ── 公共环境变量 ──────────────────────────────────────────────────────────────
+env:
+  DEFAULT_ARM64_BASE_TAG: 'harbor-arm64-base'
+
+jobs:
+  # ============================================================
+  # Job 1: 构建 amd64 包（下载官方完整离线安装包 + 注入脚本）
+  # ============================================================
+  build-amd64:
+    runs-on: ubuntu-latest
+    name: 构建 amd64 离线包
+    outputs:
+      tag_version: ${{ steps.set_env.outputs.tag_version }}
+      harbor_version: ${{ steps.set_env.outputs.harbor_version }}
+      package_name: ${{ steps.set_env.outputs.package_name }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置环境变量
+        id: set_env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            HARBOR_VERSION="${{ github.event.inputs.harbor_version }}"
+            TAG_VERSION="manual-harbor-${GITHUB_SHA::7}"
+          else
+            TAG_VERSION="${GITHUB_REF#refs/tags/}"
+            HARBOR_VERSION="${TAG_VERSION#harbor-}"
+          fi
+          PACKAGE_NAME="harbor-offline-${HARBOR_VERSION}-amd64.tar.gz"
+
+          echo "HARBOR_VERSION=${HARBOR_VERSION}"   >> $GITHUB_ENV
+          echo "TAG_VERSION=${TAG_VERSION}"         >> $GITHUB_ENV
+          echo "PACKAGE_NAME=${PACKAGE_NAME}"       >> $GITHUB_ENV
+          echo "harbor_version=${HARBOR_VERSION}"   >> $GITHUB_OUTPUT
+          echo "tag_version=${TAG_VERSION}"         >> $GITHUB_OUTPUT
+          echo "package_name=${PACKAGE_NAME}"       >> $GITHUB_OUTPUT
+
+      # ── Step 1: 下载官方 amd64 离线安装包 ────────────────────
+      - name: 下载 Harbor amd64 官方离线安装包
+        run: |
+          set -euo pipefail
+          OFFICIAL_PKG="harbor-offline-installer-${HARBOR_VERSION}.tgz"
+          DOWNLOAD_URL="https://github.com/goharbor/harbor/releases/download/${HARBOR_VERSION}/${OFFICIAL_PKG}"
+
+          echo "=== 下载 Harbor amd64 官方离线包 ==="
+          echo "版本  : ${HARBOR_VERSION}"
+          echo "URL   : ${DOWNLOAD_URL}"
+
+          wget --progress=dot:giga -O "${OFFICIAL_PKG}" "${DOWNLOAD_URL}" \
+            || { echo "❌ 下载失败: ${DOWNLOAD_URL}"; exit 1; }
+
+          echo "✓ 下载完成: $(du -h ${OFFICIAL_PKG} | cut -f1)"
+
+          # 解包官方安装包（里面包含 harbor/ 目录）
+          tar -xzf "${OFFICIAL_PKG}"
+          echo "✓ 解包完成"
+          ls -lh harbor/
+
+      # ── Step 2: 注入自定义脚本 ───────────────────────────────
+      - name: 注入 deploy-local.sh
+        run: |
+          set -euo pipefail
+          DEPLOY_SCRIPT="${GITHUB_WORKSPACE}/harbor/deploy-local.sh"
+          [ -f "$DEPLOY_SCRIPT" ] || { echo "❌ 找不到 harbor/deploy-local.sh"; exit 1; }
+
+          cp "$DEPLOY_SCRIPT" harbor/deploy-local.sh
+          chmod +x harbor/deploy-local.sh
+          echo "✓ deploy-local.sh 注入完成"
+
+      # ── Step 3: 生成元数据和说明文件 ────────────────────────
+      - name: 生成元数据和说明文件
+        run: |
+          mkdir -p harbor/meta
+          cat > harbor/meta/version.txt << EOF
+          harbor_version=${HARBOR_VERSION}
+          arch=amd64
+          image_source=official
+          build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          tag=${TAG_VERSION}
+          EOF
+
+          cat > harbor/README.txt << EOF
+          Harbor 离线安装包 ${HARBOR_VERSION} (amd64)
+          =============================================
+          镜像来源 : Harbor 官方（标准 v2.x 镜像标签）
+          架构     : amd64 (x86_64)
+          构建时间 : $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          快速部署（推荐）:
+            tar -xzf harbor-offline-${HARBOR_VERSION}-amd64.tar.gz && cd harbor
+            bash deploy-local.sh                          # 自动检测 IP，HTTPS 443
+            bash deploy-local.sh 192.168.1.100 8443       # 指定 IP 和端口
+            bash deploy-local.sh --http                   # 纯 HTTP 模式（端口 8090）
+
+          默认账号: admin / Harbor12345（首次登录后请修改）
+          前置要求: Docker 20.10.10+、docker compose、openssl
+          EOF
+          echo "✓ 元数据和说明已生成"
+
+      # ── Step 4: 打包并生成校验和 ─────────────────────────────
+      - name: 打包
+        run: |
+          set -euo pipefail
+          tar -czf "${PACKAGE_NAME}" harbor/
+          sha256sum "${PACKAGE_NAME}" > "${PACKAGE_NAME}.sha256sum.txt"
+          echo "✓ 打包完成: ${PACKAGE_NAME} ($(du -h ${PACKAGE_NAME} | cut -f1))"
+          echo "  SHA256: $(cat ${PACKAGE_NAME}.sha256sum.txt)"
+
+      # ── Step 5: 上传构建产物供 release job 使用 ──────────────
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbor-amd64
+          path: |
+            ${{ env.PACKAGE_NAME }}
+            ${{ env.PACKAGE_NAME }}.sha256sum.txt
+          retention-days: 1
+
+  # ============================================================
+  # Job 2: 构建 arm64 包（使用预上传的 arm64 镜像 + 仓库中的脚本）
+  # ============================================================
+  build-arm64:
+    runs-on: ubuntu-latest
+    name: 构建 arm64 离线包
+    outputs:
+      package_name: ${{ steps.set_env.outputs.package_name }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置环境变量
+        id: set_env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            HARBOR_VERSION="${{ github.event.inputs.harbor_version }}"
+            TAG_VERSION="manual-harbor-${GITHUB_SHA::7}"
+            ARM64_BASE_TAG="${{ github.event.inputs.arm64_base_tag }}"
+          else
+            TAG_VERSION="${GITHUB_REF#refs/tags/}"
+            HARBOR_VERSION="${TAG_VERSION#harbor-}"
+            ARM64_BASE_TAG="${DEFAULT_ARM64_BASE_TAG}"
+          fi
+          PACKAGE_NAME="harbor-offline-${HARBOR_VERSION}-arm64.tar.gz"
+          # arm64 镜像包文件名（与上传时一致）
+          ARM64_IMAGE_FILE="harbor.${HARBOR_VERSION}.tar.gz"
+
+          echo "HARBOR_VERSION=${HARBOR_VERSION}"         >> $GITHUB_ENV
+          echo "TAG_VERSION=${TAG_VERSION}"               >> $GITHUB_ENV
+          echo "ARM64_BASE_TAG=${ARM64_BASE_TAG}"         >> $GITHUB_ENV
+          echo "ARM64_IMAGE_FILE=${ARM64_IMAGE_FILE}"     >> $GITHUB_ENV
+          echo "PACKAGE_NAME=${PACKAGE_NAME}"             >> $GITHUB_ENV
+          echo "harbor_version=${HARBOR_VERSION}"         >> $GITHUB_OUTPUT
+          echo "tag_version=${TAG_VERSION}"               >> $GITHUB_OUTPUT
+          echo "package_name=${PACKAGE_NAME}"             >> $GITHUB_OUTPUT
+
+      # ── Step 1: 从本仓库 Release 下载 arm64 镜像包 ───────────
+      # 需要事先将 harbor.v2.13.0.tar.gz 上传到 tag=harbor-arm64-base 的 Release 中
+      - name: 下载 arm64 镜像包
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${ARM64_BASE_TAG}/${ARM64_IMAGE_FILE}"
+
+          echo "=== 下载 arm64 Harbor 镜像包 ==="
+          echo "Release tag : ${ARM64_BASE_TAG}"
+          echo "文件名      : ${ARM64_IMAGE_FILE}"
+          echo "URL         : ${DOWNLOAD_URL}"
+
+          # 使用 GitHub token 下载（支持私有仓库）
+          wget --progress=dot:giga \
+               --header="Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+               -O "${ARM64_IMAGE_FILE}" \
+               "${DOWNLOAD_URL}" \
+            || {
+              echo ""
+              echo "❌ 下载失败！请确认已将 arm64 镜像包上传到 Release:"
+              echo "   1. 在 GitHub 仓库 → Releases → Create release"
+              echo "   2. tag: ${ARM64_BASE_TAG}"
+              echo "   3. 上传文件: ${ARM64_IMAGE_FILE}（即 harbor.v2.13.0.tar.gz 重命名后）"
+              exit 1
+            }
+
+          echo "✓ 下载完成: $(du -h ${ARM64_IMAGE_FILE} | cut -f1)"
+
+      # ── Step 2: 组装 arm64 安装包目录结构 ────────────────────
+      # 镜像包来自 Release asset，其余文件来自仓库
+      - name: 组装安装包
+        run: |
+          set -euo pipefail
+          echo "=== 组装 arm64 安装包 ==="
+          mkdir -p harbor
+
+          # 仓库中的脚本和配置文件（不含 tar.gz）
+          REPO_HARBOR="${GITHUB_WORKSPACE}/harbor"
+          for f in deploy-local.sh install.sh common.sh prepare harbor.yml.tmpl LICENSE; do
+            if [ -f "${REPO_HARBOR}/${f}" ]; then
+              cp "${REPO_HARBOR}/${f}" harbor/
+              echo "  ✓ 复制: ${f}"
+            else
+              echo "  ⚠️  未找到: ${f}（跳过）"
+            fi
+          done
+          chmod +x harbor/prepare harbor/install.sh harbor/deploy-local.sh 2>/dev/null || true
+
+          # 镜像包（从 Release 下载的）
+          cp "${ARM64_IMAGE_FILE}" harbor/
+          echo "  ✓ 复制: ${ARM64_IMAGE_FILE}"
+
+          echo ""
+          echo "✓ 组装完成，包含文件："
+          ls -lh harbor/
+
+      # ── Step 3: 生成元数据和说明文件 ────────────────────────
+      - name: 生成元数据和说明文件
+        run: |
+          mkdir -p harbor/meta
+          cat > harbor/meta/version.txt << EOF
+          harbor_version=${HARBOR_VERSION}
+          arch=arm64
+          image_source=custom-aarch64
+          image_file=${ARM64_IMAGE_FILE}
+          build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          tag=${TAG_VERSION}
+          EOF
+
+          cat > harbor/README.txt << EOF
+          Harbor 离线安装包 ${HARBOR_VERSION} (arm64)
+          =============================================
+          镜像来源 : 自定义 aarch64 镜像（标签含 -aarch64 后缀）
+          架构     : arm64 (aarch64)
+          构建时间 : $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          快速部署（推荐）:
+            tar -xzf harbor-offline-${HARBOR_VERSION}-arm64.tar.gz && cd harbor
+            bash deploy-local.sh                          # 自动检测 IP，HTTPS 443
+            bash deploy-local.sh 192.168.1.100 8443       # 指定 IP 和端口
+            bash deploy-local.sh --http                   # 纯 HTTP 模式（端口 8090）
+
+          默认账号: admin / Harbor12345（首次登录后请修改）
+          前置要求: Docker 20.10.10+、docker compose、openssl
+          注意: 此包使用自定义 aarch64 镜像，镜像标签含 -aarch64 后缀。
+          EOF
+          echo "✓ 元数据和说明已生成"
+
+      # ── Step 4: 打包并生成校验和 ─────────────────────────────
+      - name: 打包
+        run: |
+          set -euo pipefail
+          tar -czf "${PACKAGE_NAME}" harbor/
+          sha256sum "${PACKAGE_NAME}" > "${PACKAGE_NAME}.sha256sum.txt"
+          echo "✓ 打包完成: ${PACKAGE_NAME} ($(du -h ${PACKAGE_NAME} | cut -f1))"
+          echo "  SHA256: $(cat ${PACKAGE_NAME}.sha256sum.txt)"
+
+      # ── Step 5: 上传构建产物供 release job 使用 ──────────────
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbor-arm64
+          path: |
+            ${{ env.PACKAGE_NAME }}
+            ${{ env.PACKAGE_NAME }}.sha256sum.txt
+          retention-days: 1
+
+  # ============================================================
+  # Job 3: 发布到 GitHub Release（等待两个 arch 都构建完成）
+  # ============================================================
+  release:
+    runs-on: ubuntu-latest
+    name: 发布到 GitHub Release
+    needs: [build-amd64, build-arm64]
+
+    steps:
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files/
+
+      - name: 整理发布文件
+        run: |
+          echo "=== 准备发布文件 ==="
+          find release-files/ -type f | sort
+          # 把所有文件移到统一目录
+          mkdir -p dist
+          find release-files/ -type f -exec cp {} dist/ \;
+          ls -lh dist/
+
+      - name: 发布到 GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.build-amd64.outputs.tag_version }}
+          name: "Harbor 离线包 ${{ needs.build-amd64.outputs.harbor_version }}"
+          body: |
+            ## Harbor 离线安装包 ${{ needs.build-amd64.outputs.harbor_version }}
+
+            ### 下载
+            | 架构 | 文件 | 说明 |
+            |------|------|------|
+            | amd64 (x86_64) | `harbor-offline-${{ needs.build-amd64.outputs.harbor_version }}-amd64.tar.gz` | 官方标准镜像 |
+            | arm64 (aarch64) | `harbor-offline-${{ needs.build-amd64.outputs.harbor_version }}-arm64.tar.gz` | 自定义 aarch64 镜像 |
+
+            ### 快速安装
+            ```bash
+            # 以 arm64 为例
+            tar -xzf harbor-offline-${{ needs.build-amd64.outputs.harbor_version }}-arm64.tar.gz
+            cd harbor/
+
+            # 一键部署（自动检测 IP，HTTPS 443）
+            bash deploy-local.sh
+
+            # 指定 IP 和 HTTPS 端口
+            bash deploy-local.sh 192.168.1.100 8443
+
+            # 纯 HTTP 模式（端口 8090）
+            bash deploy-local.sh --http
+            ```
+
+            ### 包含内容
+            - Harbor 离线镜像包（`harbor.v*.tar.gz`）
+            - 一键部署脚本 `deploy-local.sh`（自动证书 / 配置 / 启动）
+            - 官方 `install.sh` 及 `harbor.yml.tmpl`
+
+            ### 前置要求
+            - Docker 20.10.10+（含 docker compose）
+            - openssl
+          files: dist/*
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
