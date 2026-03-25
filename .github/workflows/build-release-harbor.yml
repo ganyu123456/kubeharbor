@@ -40,9 +40,11 @@ permissions:
 # ── 公共环境变量 ──────────────────────────────────────────────────────────────
 env:
   DEFAULT_ARM64_BASE_TAG: 'harbor-arm64-base'
-  # Docker 静态包版本（用于 arm64 完全离线安装）
+  # Docker 静态包版本（用于完全离线安装）
   DOCKER_VERSION: '27.5.1'
   DOCKER_COMPOSE_VERSION: 'v2.33.1'
+  # Helm 版本（随包安装，用于向 Harbor 推送 Helm Chart）
+  HELM_VERSION: 'v3.19.2'
 
 jobs:
   # ============================================================
@@ -149,6 +151,19 @@ jobs:
           chmod +x "${OFFLINE_DIR}/docker-compose"
           echo "✓ docker-compose: $(du -h ${OFFLINE_DIR}/docker-compose | cut -f1)"
 
+          # Helm CLI（linux/amd64，用于向 Harbor 推送 Helm Chart）
+          HELM_TAR="helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          HELM_URL="https://get.helm.sh/${HELM_TAR}"
+          echo "=== 下载 Helm ${HELM_VERSION} linux/amd64 ==="
+          echo "URL: ${HELM_URL}"
+          wget --progress=dot:giga -O helm.tar.gz "${HELM_URL}" \
+            || { echo "❌ 下载 Helm 失败"; exit 1; }
+          tar -xzf helm.tar.gz
+          mv linux-amd64/helm "${OFFLINE_DIR}/helm"
+          chmod +x "${OFFLINE_DIR}/helm"
+          rm -rf linux-amd64 helm.tar.gz
+          echo "✓ helm: $(du -h ${OFFLINE_DIR}/helm | cut -f1)"
+
           echo ""
           echo "✓ 离线工具包内容:"
           ls -lh "${OFFLINE_DIR}/"
@@ -182,9 +197,14 @@ jobs:
 
           说明:
             - Docker ${DOCKER_VERSION} 和 Docker Compose ${DOCKER_COMPOSE_VERSION} 已内置，自动安装
+            - Helm ${HELM_VERSION} 已内置，自动安装到 /usr/local/bin/helm
             - Harbor 镜像已内置，完全无需联网
             - 自动签发自签名 TLS 证书，直接启用 HTTPS
             - 支持: Ubuntu 20.04+ / Debian 11+ / CentOS 7+ / RHEL 8+
+
+          推送 Helm Chart 到 Harbor（helm 安装后可直接使用）:
+            helm registry login <HARBOR_HOST>:<PORT> -u admin -p Harbor12345 --insecure
+            helm push <chart>.tgz oci://<HARBOR_HOST>:<PORT>/library
 
           默认账号: admin / Harbor12345（首次登录后请修改）
           EOF
@@ -298,6 +318,19 @@ jobs:
           chmod +x "${OFFLINE_DIR}/docker-compose"
           echo "✓ docker-compose: $(du -h ${OFFLINE_DIR}/docker-compose | cut -f1)"
 
+          # Helm CLI（linux/arm64，用于向 Harbor 推送 Helm Chart）
+          HELM_TAR="helm-${HELM_VERSION}-linux-arm64.tar.gz"
+          HELM_URL="https://get.helm.sh/${HELM_TAR}"
+          echo "=== 下载 Helm ${HELM_VERSION} linux/arm64 ==="
+          echo "URL: ${HELM_URL}"
+          wget --progress=dot:giga -O helm.tar.gz "${HELM_URL}" \
+            || { echo "❌ 下载 Helm 失败"; exit 1; }
+          tar -xzf helm.tar.gz
+          mv linux-arm64/helm "${OFFLINE_DIR}/helm"
+          chmod +x "${OFFLINE_DIR}/helm"
+          rm -rf linux-arm64 helm.tar.gz
+          echo "✓ helm: $(du -h ${OFFLINE_DIR}/helm | cut -f1)"
+
           echo ""
           echo "✓ 离线工具包内容:"
           ls -lh "${OFFLINE_DIR}/"
@@ -363,9 +396,14 @@ jobs:
 
           说明:
             - Docker ${DOCKER_VERSION} 和 Docker Compose ${DOCKER_COMPOSE_VERSION} 已内置，自动安装
+            - Helm ${HELM_VERSION} 已内置，自动安装到 /usr/local/bin/helm
             - Harbor 镜像已内置，完全无需联网
             - 自动签发自签名 TLS 证书，直接启用 HTTPS
             - 支持: Ubuntu 20.04+ / Debian 11+ / 麒麟 / openEuler 等 arm64 Linux
+
+          推送 Helm Chart 到 Harbor（helm 安装后可直接使用）:
+            helm registry login <HARBOR_HOST>:<PORT> -u admin -p Harbor12345 --insecure
+            helm push <chart>.tgz oci://<HARBOR_HOST>:<PORT>/library
 
           默认账号: admin / Harbor12345（首次登录后请修改）
           注意: 此包使用自定义 aarch64 镜像，镜像标签含 -aarch64 后缀。
@@ -453,8 +491,17 @@ jobs:
 
             ### 包含内容
             - Harbor 离线镜像包（`harbor.v*.tar.gz`）
-            - 一键部署脚本 `install.sh`（自动安装 Docker / 证书 / 配置 / 启动）
-            - `offline/` 目录：Docker 静态包 + Docker Compose 二进制（完全离线）
+            - 一键部署脚本 `install.sh`（自动安装 Docker / 证书 / 配置 / 启动 / Helm）
+            - `offline/` 目录：Docker 静态包 + Docker Compose + **Helm ${{ env.HELM_VERSION }}**（完全离线）
+
+            ### 推送 Helm Chart 到 Harbor
+            ```bash
+            # Harbor 部署完成后，helm 已自动安装到 /usr/local/bin/helm
+            helm registry login <HARBOR_HOST>:<PORT> -u admin -p Harbor12345 --insecure
+            helm push <chart>.tgz oci://<HARBOR_HOST>:<PORT>/library
+            # 查看已上传的 chart
+            helm show all oci://<HARBOR_HOST>:<PORT>/library/<chart-name>
+            ```
 
             ### 前置要求
             - root 权限

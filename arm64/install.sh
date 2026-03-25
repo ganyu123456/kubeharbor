@@ -412,6 +412,26 @@ fi
 docker compose up -d
 success "Harbor 已成功启动"
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 7/7  安装 Helm CLI（离线，用于推送 Helm Chart 到 Harbor）
+# ═══════════════════════════════════════════════════════════════════════════════
+step "7/7  安装 Helm CLI（离线）"
+
+if command -v helm &>/dev/null; then
+  success "Helm 已在 PATH: $(helm version --short 2>/dev/null)"
+else
+  HELM_BIN="${OFFLINE_DIR}/helm"
+  if [ -f "$HELM_BIN" ]; then
+    info "从离线包安装 Helm 到 /usr/local/bin/..."
+    cp "$HELM_BIN" /usr/local/bin/helm
+    chmod +x /usr/local/bin/helm
+    success "Helm 安装成功: $(helm version --short 2>/dev/null)"
+  else
+    warn "离线包中未找到 helm（${HELM_BIN}），跳过安装"
+    warn "如需手动安装: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash"
+  fi
+fi
+
 # ── 完成提示 ────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -440,4 +460,15 @@ echo ""
 echo "  数据目录  : $DATA_DIR"
 echo "  查看日志  : docker compose -f ${SCRIPT_DIR}/docker-compose.yml logs -f"
 echo "  停止服务  : docker compose -f ${SCRIPT_DIR}/docker-compose.yml down"
+echo ""
+echo "  推送 Helm Chart 到此 Harbor（OCI 方式）："
+echo "    # 1. 登录 Harbor OCI 仓库"
+echo "    helm registry login ${HOST}:${HTTPS_PORT} -u admin -p Harbor12345 --insecure"
+echo "    # 或使用 ca.crt 信任证书登录（推荐）："
+echo "    helm registry login ${HOST}:${HTTPS_PORT} -u admin -p Harbor12345 \\"
+echo "      --ca-file ${CERT_DIR}/ca.crt"
+echo "    # 2. 推送 chart（上传到 library 项目，可换为其他项目名）"
+echo "    helm push <chart>.tgz oci://${HOST}:${HTTPS_PORT}/library"
+echo "    # 3. 拉取已上传的 chart"
+echo "    helm pull oci://${HOST}:${HTTPS_PORT}/library/<chart-name> --version <version>"
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
