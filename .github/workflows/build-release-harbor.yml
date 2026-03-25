@@ -5,17 +5,15 @@ name: 构建和发布 Harbor 离线安装包
 # 2. 手动触发（workflow_dispatch）→ 可指定版本和 arm64 镜像来源
 #
 # ── 目录结构说明 ──────────────────────────────────────────────────────────────
-# amd64/deploy-local.sh      → 注入到官方离线包的自定义脚本
-# arm64/                     → ARM64 完整自维护包（脚本 + 镜像）
-#   ├── deploy-local.sh
-#   ├── harbor.yml.tmpl
-#   ├── install.sh
+# amd64/install.sh           → 注入到官方离线包的自定义一键部署脚本
+# arm64/                     → ARM64 完整自维护包（脚本 + 配置 + 镜像）
+#   ├── install.sh           → 一键部署脚本（完全离线）
+#   ├── harbor.yml.tmpl      → Harbor 配置模板
 #   ├── common.sh
-#   ├── prepare
-#   ├── LICENSE
-#   └── harbor.v*.tar.gz     ← gitignored，需预先上传到 Release（tag: harbor-arm64-base）
+#   ├── prepare              → Harbor prepare 二进制（aarch64）
+#   └── LICENSE
 #
-# ── arm64 镜像预上传步骤（一次性操作）────────────────────────────────────────
+# ── arm64 Harbor 镜像预上传步骤（一次性操作）────────────────────────────────
 #   1. GitHub 仓库 → Releases → Create a new release
 #   2. tag: harbor-arm64-base，title: Harbor ARM64 Base Images
 #   3. 上传 harbor.v2.13.0.tar.gz 作为附件
@@ -25,10 +23,6 @@ on:
   push:
     tags:
       - 'harbor-v*'
-    paths:
-      - 'amd64/deploy-local.sh'
-      - 'arm64/**'
-      - '.github/workflows/build-release-harbor.yml'
   workflow_dispatch:
     inputs:
       harbor_version:
@@ -46,6 +40,9 @@ permissions:
 # ── 公共环境变量 ──────────────────────────────────────────────────────────────
 env:
   DEFAULT_ARM64_BASE_TAG: 'harbor-arm64-base'
+  # Docker 静态包版本（用于 arm64 完全离线安装）
+  DOCKER_VERSION: '27.5.1'
+  DOCKER_COMPOSE_VERSION: 'v2.33.1'
 
 jobs:
   # ============================================================
@@ -98,31 +95,74 @@ jobs:
 
           echo "✓ 下载完成: $(du -h ${OFFICIAL_PKG} | cut -f1)"
 
-          # 解压到独立临时目录，避免与仓库目录冲突
+          # 解压到独立临时目录
           mkdir -p /tmp/harbor-official
           tar -xzf "${OFFICIAL_PKG}" -C /tmp/harbor-official
           echo "✓ 解包完成"
           ls -lh /tmp/harbor-official/harbor/
 
-      # ── Step 2: 注入自定义脚本 ───────────────────────────────
-      - name: 注入 deploy-local.sh
+      # ── Step 2: 注入自定义 install.sh ────────────────────────
+      - name: 注入 install.sh
         run: |
           set -euo pipefail
-          DEPLOY_SCRIPT="${GITHUB_WORKSPACE}/amd64/deploy-local.sh"
-          [ -f "$DEPLOY_SCRIPT" ] || { echo "❌ 找不到 amd64/deploy-local.sh"; exit 1; }
+          INSTALL_SCRIPT="${GITHUB_WORKSPACE}/amd64/install.sh"
+          [ -f "$INSTALL_SCRIPT" ] || { echo "❌ 找不到 amd64/install.sh"; exit 1; }
 
-          cp "$DEPLOY_SCRIPT" /tmp/harbor-official/harbor/deploy-local.sh
-          chmod +x /tmp/harbor-official/harbor/deploy-local.sh
-          echo "✓ deploy-local.sh 注入完成"
+          cp "$INSTALL_SCRIPT" /tmp/harbor-official/harbor/install.sh
+          chmod +x /tmp/harbor-official/harbor/install.sh
+          echo "✓ install.sh 注入完成"
 
-      # ── Step 3: 生成元数据和说明文件 ────────────────────────
-      - name: 生成元数据和说明文件
+          # 确保 harbor.yml.tmpl 存在（官方包已包含，若无则从 arm64/ 复制）
+          if [ ! -f /tmp/harbor-official/harbor/harbor.yml.tmpl ]; then
+            if [ -f "${GITHUB_WORKSPACE}/arm64/harbor.yml.tmpl" ]; then
+              cp "${GITHUB_WORKSPACE}/arm64/harbor.yml.tmpl" /tmp/harbor-official/harbor/harbor.yml.tmpl
+              echo "✓ harbor.yml.tmpl 已从 arm64/ 补充"
+            else
+              echo "⚠️  未找到 harbor.yml.tmpl（官方包可能已内置，忽略）"
+            fi
+          else
+            echo "✓ harbor.yml.tmpl 已存在于官方包中"
+          fi
+
+      # ── Step 2.5: 下载 Docker 静态包（x86_64，用于完全离线安装）
+      - name: 下载 Docker 和 Docker Compose 离线包（x86_64）
+        run: |
+          set -euo pipefail
+          OFFLINE_DIR="/tmp/harbor-official/harbor/offline"
+          mkdir -p "$OFFLINE_DIR"
+
+          # Docker 静态二进制包（x86_64）
+          DOCKER_TGZ="docker-${DOCKER_VERSION}.tgz"
+          DOCKER_URL="https://download.docker.com/linux/static/stable/x86_64/${DOCKER_TGZ}"
+          echo "=== 下载 Docker ${DOCKER_VERSION} x86_64 静态包 ==="
+          echo "URL: ${DOCKER_URL}"
+          wget --progress=dot:giga -O "${OFFLINE_DIR}/${DOCKER_TGZ}" "${DOCKER_URL}" \
+            || { echo "❌ 下载 Docker 静态包失败"; exit 1; }
+          echo "✓ docker: $(du -h ${OFFLINE_DIR}/${DOCKER_TGZ} | cut -f1)"
+
+          # Docker Compose 二进制（linux/amd64）
+          COMPOSE_URL="https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-linux-x86_64"
+          echo "=== 下载 Docker Compose ${DOCKER_COMPOSE_VERSION} linux/amd64 ==="
+          echo "URL: ${COMPOSE_URL}"
+          wget --progress=dot:giga -O "${OFFLINE_DIR}/docker-compose" "${COMPOSE_URL}" \
+            || { echo "❌ 下载 Docker Compose 失败"; exit 1; }
+          chmod +x "${OFFLINE_DIR}/docker-compose"
+          echo "✓ docker-compose: $(du -h ${OFFLINE_DIR}/docker-compose | cut -f1)"
+
+          echo ""
+          echo "✓ 离线工具包内容:"
+          ls -lh "${OFFLINE_DIR}/"
+
+      # ── Step 3: 生成说明文件 ─────────────────────────────────
+      - name: 生成说明文件
         run: |
           mkdir -p /tmp/harbor-official/harbor/meta
           cat > /tmp/harbor-official/harbor/meta/version.txt << EOF
           harbor_version=${HARBOR_VERSION}
           arch=amd64
           image_source=official
+          docker_version=${DOCKER_VERSION}
+          docker_compose_version=${DOCKER_COMPOSE_VERSION}
           build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           tag=${TAG_VERSION}
           EOF
@@ -134,16 +174,21 @@ jobs:
           架构     : amd64 (x86_64)
           构建时间 : $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-          快速部署（推荐）:
+          快速部署（一键，完全离线，无需联网）:
             tar -xzf harbor-offline-${HARBOR_VERSION}-amd64.tar.gz && cd harbor
-            bash deploy-local.sh                          # 自动检测 IP，HTTPS 443
-            bash deploy-local.sh 192.168.1.100 8443       # 指定 IP 和端口
-            bash deploy-local.sh --http                   # 纯 HTTP 模式（端口 8090）
+            sudo bash install.sh                          # 自动检测 IP，HTTPS 443
+            sudo bash install.sh 192.168.1.100 8443       # 指定 IP 和端口
+            sudo bash install.sh --domain harbor.local    # 使用域名
+
+          说明:
+            - Docker ${DOCKER_VERSION} 和 Docker Compose ${DOCKER_COMPOSE_VERSION} 已内置，自动安装
+            - Harbor 镜像已内置，完全无需联网
+            - 自动签发自签名 TLS 证书，直接启用 HTTPS
+            - 支持: Ubuntu 20.04+ / Debian 11+ / CentOS 7+ / RHEL 8+
 
           默认账号: admin / Harbor12345（首次登录后请修改）
-          前置要求: Docker 20.10.10+、docker compose、openssl
           EOF
-          echo "✓ 元数据和说明已生成"
+          echo "✓ 说明文件已生成"
 
       # ── Step 4: 打包并生成校验和 ─────────────────────────────
       - name: 打包
@@ -154,7 +199,7 @@ jobs:
           echo "✓ 打包完成: ${PACKAGE_NAME} ($(du -h ${PACKAGE_NAME} | cut -f1))"
           echo "  SHA256: $(cat ${PACKAGE_NAME}.sha256sum.txt)"
 
-      # ── Step 5: 上传构建产物供 release job 使用 ──────────────
+      # ── Step 5: 上传构建产物 ──────────────────────────────────
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
@@ -165,7 +210,7 @@ jobs:
           retention-days: 1
 
   # ============================================================
-  # Job 2: 构建 arm64 包（使用预上传的 arm64 镜像 + 仓库中的脚本）
+  # Job 2: 构建 arm64 包（Harbor 镜像从 Release 下载 + 离线 Docker 包）
   # ============================================================
   build-arm64:
     runs-on: ubuntu-latest
@@ -201,8 +246,8 @@ jobs:
           echo "tag_version=${TAG_VERSION}"               >> $GITHUB_OUTPUT
           echo "package_name=${PACKAGE_NAME}"             >> $GITHUB_OUTPUT
 
-      # ── Step 1: 从本仓库 Release 下载 arm64 镜像包 ───────────
-      - name: 下载 arm64 镜像包
+      # ── Step 1: 从本仓库 Release 下载 arm64 Harbor 镜像包 ────
+      - name: 下载 arm64 Harbor 镜像包
         run: |
           set -euo pipefail
           REPO="${{ github.repository }}"
@@ -222,14 +267,42 @@ jobs:
               echo "❌ 下载失败！请确认已将 arm64 镜像包上传到 Release:"
               echo "   1. 在 GitHub 仓库 → Releases → Create release"
               echo "   2. tag: ${ARM64_BASE_TAG}"
-              echo "   3. 上传文件: ${ARM64_IMAGE_FILE}（即 harbor.v2.13.0.tar.gz 重命名后）"
+              echo "   3. 上传文件: harbor.${HARBOR_VERSION}.tar.gz"
               exit 1
             }
 
           echo "✓ 下载完成: $(du -h ${ARM64_IMAGE_FILE} | cut -f1)"
 
-      # ── Step 2: 组装 arm64 安装包目录结构 ────────────────────
-      # 脚本和配置来自仓库 arm64/ 目录，镜像来自 Release 下载
+      # ── Step 2: 下载 Docker 静态包（aarch64，用于完全离线安装）
+      - name: 下载 Docker 和 Docker Compose 离线包（aarch64）
+        run: |
+          set -euo pipefail
+          OFFLINE_DIR="/tmp/harbor-arm64/harbor/offline"
+          mkdir -p "$OFFLINE_DIR"
+
+          # Docker 静态二进制包（aarch64）
+          DOCKER_TGZ="docker-${DOCKER_VERSION}.tgz"
+          DOCKER_URL="https://download.docker.com/linux/static/stable/aarch64/${DOCKER_TGZ}"
+          echo "=== 下载 Docker ${DOCKER_VERSION} aarch64 静态包 ==="
+          echo "URL: ${DOCKER_URL}"
+          wget --progress=dot:giga -O "${OFFLINE_DIR}/${DOCKER_TGZ}" "${DOCKER_URL}" \
+            || { echo "❌ 下载 Docker 静态包失败"; exit 1; }
+          echo "✓ docker: $(du -h ${OFFLINE_DIR}/${DOCKER_TGZ} | cut -f1)"
+
+          # Docker Compose 二进制（linux/arm64）
+          COMPOSE_URL="https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-linux-aarch64"
+          echo "=== 下载 Docker Compose ${DOCKER_COMPOSE_VERSION} linux/arm64 ==="
+          echo "URL: ${COMPOSE_URL}"
+          wget --progress=dot:giga -O "${OFFLINE_DIR}/docker-compose" "${COMPOSE_URL}" \
+            || { echo "❌ 下载 Docker Compose 失败"; exit 1; }
+          chmod +x "${OFFLINE_DIR}/docker-compose"
+          echo "✓ docker-compose: $(du -h ${OFFLINE_DIR}/docker-compose | cut -f1)"
+
+          echo ""
+          echo "✓ 离线工具包内容:"
+          ls -lh "${OFFLINE_DIR}/"
+
+      # ── Step 3: 组装 arm64 安装包目录结构 ────────────────────
       - name: 组装安装包
         run: |
           set -euo pipefail
@@ -238,7 +311,7 @@ jobs:
 
           # 从仓库 arm64/ 目录复制脚本和配置文件
           REPO_ARM64="${GITHUB_WORKSPACE}/arm64"
-          for f in deploy-local.sh install.sh common.sh prepare harbor.yml.tmpl LICENSE; do
+          for f in install.sh common.sh prepare harbor.yml.tmpl LICENSE; do
             if [ -f "${REPO_ARM64}/${f}" ]; then
               cp "${REPO_ARM64}/${f}" /tmp/harbor-arm64/harbor/
               echo "  ✓ 复制: arm64/${f}"
@@ -246,20 +319,22 @@ jobs:
               echo "  ⚠️  未找到: arm64/${f}（跳过）"
             fi
           done
-          chmod +x /tmp/harbor-arm64/harbor/prepare \
-                   /tmp/harbor-arm64/harbor/install.sh \
-                   /tmp/harbor-arm64/harbor/deploy-local.sh 2>/dev/null || true
+          chmod +x /tmp/harbor-arm64/harbor/install.sh 2>/dev/null || true
+          chmod +x /tmp/harbor-arm64/harbor/prepare     2>/dev/null || true
 
-          # 将下载的镜像包放入目录
+          # 将 Harbor 镜像包放入目录
           cp "${ARM64_IMAGE_FILE}" /tmp/harbor-arm64/harbor/
           echo "  ✓ 复制: ${ARM64_IMAGE_FILE}"
 
           echo ""
-          echo "✓ 组装完成，包含文件："
+          echo "✓ 组装完成，包含文件:"
           ls -lh /tmp/harbor-arm64/harbor/
+          echo ""
+          echo "  offline/ 目录:"
+          ls -lh /tmp/harbor-arm64/harbor/offline/
 
-      # ── Step 3: 生成元数据和说明文件 ────────────────────────
-      - name: 生成元数据和说明文件
+      # ── Step 4: 生成说明文件 ─────────────────────────────────
+      - name: 生成说明文件
         run: |
           mkdir -p /tmp/harbor-arm64/harbor/meta
           cat > /tmp/harbor-arm64/harbor/meta/version.txt << EOF
@@ -267,6 +342,8 @@ jobs:
           arch=arm64
           image_source=custom-aarch64
           image_file=${ARM64_IMAGE_FILE}
+          docker_version=${DOCKER_VERSION}
+          docker_compose_version=${DOCKER_COMPOSE_VERSION}
           build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           tag=${TAG_VERSION}
           EOF
@@ -278,19 +355,24 @@ jobs:
           架构     : arm64 (aarch64)
           构建时间 : $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-          快速部署（推荐）:
+          快速部署（一键，完全离线，无需联网）:
             tar -xzf harbor-offline-${HARBOR_VERSION}-arm64.tar.gz && cd harbor
-            bash deploy-local.sh                          # 自动检测 IP，HTTPS 443
-            bash deploy-local.sh 192.168.1.100 8443       # 指定 IP 和端口
-            bash deploy-local.sh --http                   # 纯 HTTP 模式（端口 8090）
+            sudo bash install.sh                          # 自动检测 IP，HTTPS 443
+            sudo bash install.sh 192.168.1.100 8443       # 指定 IP 和端口
+            sudo bash install.sh --domain harbor.local    # 使用域名
+
+          说明:
+            - Docker ${DOCKER_VERSION} 和 Docker Compose ${DOCKER_COMPOSE_VERSION} 已内置，自动安装
+            - Harbor 镜像已内置，完全无需联网
+            - 自动签发自签名 TLS 证书，直接启用 HTTPS
+            - 支持: Ubuntu 20.04+ / Debian 11+ / 麒麟 / openEuler 等 arm64 Linux
 
           默认账号: admin / Harbor12345（首次登录后请修改）
-          前置要求: Docker 20.10.10+、docker compose、openssl
           注意: 此包使用自定义 aarch64 镜像，镜像标签含 -aarch64 后缀。
           EOF
-          echo "✓ 元数据和说明已生成"
+          echo "✓ 说明文件已生成"
 
-      # ── Step 4: 打包并生成校验和 ─────────────────────────────
+      # ── Step 5: 打包并生成校验和 ─────────────────────────────
       - name: 打包
         run: |
           set -euo pipefail
@@ -299,7 +381,7 @@ jobs:
           echo "✓ 打包完成: ${PACKAGE_NAME} ($(du -h ${PACKAGE_NAME} | cut -f1))"
           echo "  SHA256: $(cat ${PACKAGE_NAME}.sha256sum.txt)"
 
-      # ── Step 5: 上传构建产物供 release job 使用 ──────────────
+      # ── Step 6: 上传构建产物 ──────────────────────────────────
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
@@ -342,33 +424,41 @@ jobs:
             ### 下载
             | 架构 | 文件 | 说明 |
             |------|------|------|
-            | amd64 (x86_64) | `harbor-offline-${{ needs.build-amd64.outputs.harbor_version }}-amd64.tar.gz` | 官方标准镜像 |
-            | arm64 (aarch64) | `harbor-offline-${{ needs.build-amd64.outputs.harbor_version }}-arm64.tar.gz` | 自定义 aarch64 镜像 |
+            | amd64 (x86_64) | `harbor-offline-${{ needs.build-amd64.outputs.harbor_version }}-amd64.tar.gz` | 官方标准镜像，**完全离线**（含 Docker ${{ env.DOCKER_VERSION }}）|
+            | arm64 (aarch64) | `harbor-offline-${{ needs.build-amd64.outputs.harbor_version }}-arm64.tar.gz` | 自定义 aarch64 镜像，**完全离线**（含 Docker ${{ env.DOCKER_VERSION }}）|
 
             ### 快速安装
+
+            #### amd64（完全离线，Docker 已内置无需联网）
             ```bash
-            # 以 arm64 为例
+            tar -xzf harbor-offline-${{ needs.build-amd64.outputs.harbor_version }}-amd64.tar.gz
+            cd harbor/
+            sudo bash install.sh                          # 自动检测 IP，HTTPS 443
+            sudo bash install.sh 192.168.1.100 8443       # 指定 IP 和端口
+            ```
+
+            #### arm64（完全离线，Docker 已内置无需联网）
+            ```bash
             tar -xzf harbor-offline-${{ needs.build-amd64.outputs.harbor_version }}-arm64.tar.gz
             cd harbor/
-
-            # 一键部署（自动检测 IP，HTTPS 443）
-            bash deploy-local.sh
-
-            # 指定 IP 和 HTTPS 端口
-            bash deploy-local.sh 192.168.1.100 8443
-
-            # 纯 HTTP 模式（端口 8090）
-            bash deploy-local.sh --http
+            sudo bash install.sh                          # 自动检测 IP，HTTPS 443
+            sudo bash install.sh 192.168.1.100 8443       # 指定 IP 和端口
             ```
+
+            ### 功能特性
+            - ✅ 一键部署，自动签发自签名 TLS 证书，直接启用 HTTPS
+            - ✅ **amd64 和 arm64 均完全离线**，Docker ${{ env.DOCKER_VERSION }} + Compose ${{ env.DOCKER_COMPOSE_VERSION }} 已内置
+            - ✅ 客户只需一台裸 Linux，解压 → `sudo bash install.sh` 即可完成部署
+            - ✅ 支持 IP 或域名，SAN 证书自动匹配
 
             ### 包含内容
             - Harbor 离线镜像包（`harbor.v*.tar.gz`）
-            - 一键部署脚本 `deploy-local.sh`（自动证书 / 配置 / 启动）
-            - 官方 `install.sh` 及 `harbor.yml.tmpl`
+            - 一键部署脚本 `install.sh`（自动安装 Docker / 证书 / 配置 / 启动）
+            - `offline/` 目录：Docker 静态包 + Docker Compose 二进制（完全离线）
 
             ### 前置要求
-            - Docker 20.10.10+（含 docker compose）
-            - openssl
+            - root 权限
+            - 无需联网（两个架构均完全离线）
           files: dist/*
           generate_release_notes: false
           fail_on_unmatched_files: true
